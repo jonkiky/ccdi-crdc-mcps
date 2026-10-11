@@ -1,0 +1,7 @@
+mcp==2.3.0
+httpx<1,>=0.28
+jsonschema<5,>=4
+uvicorn<1,>=0.34
+
+[test]
+pytest<10,>=8

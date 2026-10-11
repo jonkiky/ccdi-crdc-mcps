@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccdi-cbioportal-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for the CCDI cBioPortal REST API"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.3.0",
+  "httpx>=0.28,<1",
+  "jsonschema>=4,<5",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cbioportal_mcp*"]
+
+[tool.setuptools.package-data]
+cbioportal_mcp = ["assets/openapi.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

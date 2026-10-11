@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: ccdi-cbioportal-mcp
+Version: 0.1.0
+Summary: Read-only MCP server for the CCDI cBioPortal REST API
+Requires-Python: >=3.11
+Requires-Dist: mcp==2.3.0
+Requires-Dist: httpx<1,>=0.28
+Requires-Dist: jsonschema<5,>=4
+Requires-Dist: uvicorn<1,>=0.34
+Provides-Extra: test
+Requires-Dist: pytest<10,>=8; extra == "test"

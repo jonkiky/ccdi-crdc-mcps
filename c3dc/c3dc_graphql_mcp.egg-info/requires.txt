@@ -1,0 +1,9 @@
+mcp==2.3.0
+graphql-core<4,>=3.2
+PyYAML<7,>=6
+httpx<1,>=0.28
+uvicorn<1,>=0.34
+
+[test]
+pytest<10,>=8
+pytest-asyncio<2,>=0.24

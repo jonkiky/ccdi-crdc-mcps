@@ -1,0 +1,990 @@
+"""Find changes between GraphQL schemas"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+
+from ..language import print_ast
+from ..pyutils import inspect
+from ..type import (
+    GraphQLArgument,
+    GraphQLEnumType,
+    GraphQLField,
+    GraphQLInputField,
+    GraphQLInputObjectType,
+    GraphQLInterfaceType,
+    GraphQLNamedType,
+    GraphQLObjectType,
+    GraphQLScalarType,
+    GraphQLSchema,
+    GraphQLType,
+    GraphQLUnionType,
+    is_enum_type,
+    is_input_object_type,
+    is_interface_type,
+    is_list_type,
+    is_named_type,
+    is_non_null_type,
+    is_object_type,
+    is_required_argument,
+    is_required_input_field,
+    is_specified_scalar_type,
+    is_union_type,
+)
+from ..utilities.sort_value_node import sort_value_node
+from .get_default_value_ast import get_default_value_ast
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+
+__all__ = [
+    "BreakingChange",
+    "BreakingChangeType",
+    "DangerousChange",
+    "DangerousChangeType",
+    "SafeChange",
+    "SafeChangeType",
+    "SchemaChange",
+    "find_breaking_changes",
+    "find_dangerous_changes",
+    "find_schema_changes",
+]
+
+
+class BreakingChangeType(Enum):
+    """Types of breaking changes
+
+    Categories of schema changes that may break existing operations.
+    """
+
+    TYPE_REMOVED = 10
+    TYPE_CHANGED_KIND = 11
+    TYPE_REMOVED_FROM_UNION = 20
+    VALUE_REMOVED_FROM_ENUM = 21
+    REQUIRED_INPUT_FIELD_ADDED = 22
+    IMPLEMENTED_INTERFACE_REMOVED = 23
+    FIELD_REMOVED = 30
+    FIELD_CHANGED_KIND = 31
+    REQUIRED_ARG_ADDED = 40
+    ARG_REMOVED = 41
+    ARG_CHANGED_KIND = 42
+    DIRECTIVE_REMOVED = 50
+    DIRECTIVE_ARG_REMOVED = 51
+    REQUIRED_DIRECTIVE_ARG_ADDED = 52
+    DIRECTIVE_REPEATABLE_REMOVED = 53
+    DIRECTIVE_LOCATION_REMOVED = 54
+
+
+class DangerousChangeType(Enum):
+    """Types of dangerous changes
+
+    Categories of schema changes that may be dangerous for existing operations.
+    """
+
+    VALUE_ADDED_TO_ENUM = 60
+    TYPE_ADDED_TO_UNION = 61
+    OPTIONAL_INPUT_FIELD_ADDED = 62
+    OPTIONAL_ARG_ADDED = 63
+    IMPLEMENTED_INTERFACE_ADDED = 64
+    ARG_DEFAULT_VALUE_CHANGE = 65
+    INPUT_FIELD_DEFAULT_VALUE_CHANGE = 66
+
+
+class SafeChangeType(Enum):
+    """Types of safe changes
+
+    Categories of schema changes that are considered safe for existing operations.
+    """
+
+    TYPE_ADDED = 70
+    OPTIONAL_INPUT_FIELD_ADDED = 71
+    OPTIONAL_ARG_ADDED = 72
+    DIRECTIVE_ADDED = 73
+    FIELD_ADDED = 74
+    DIRECTIVE_REPEATABLE_ADDED = 75
+    DIRECTIVE_LOCATION_ADDED = 76
+    OPTIONAL_DIRECTIVE_ARG_ADDED = 77
+    FIELD_CHANGED_KIND_SAFE = 78
+    ARG_CHANGED_KIND_SAFE = 79
+    ARG_DEFAULT_VALUE_ADDED = 80
+    DESCRIPTION_CHANGED = 81
+    INPUT_FIELD_DEFAULT_VALUE_ADDED = 82
+
+
+class BreakingChange(NamedTuple):
+    """Type and description of a breaking change
+
+    Description of a schema change that may break existing operations.
+    """
+
+    type: BreakingChangeType
+    """Specific kind of breaking schema change."""
+    description: str
+    """Human-readable description of the breaking schema change."""
+
+
+class DangerousChange(NamedTuple):
+    """Type and description of a dangerous change
+
+    Description of a schema change that may be dangerous for existing operations.
+    """
+
+    type: DangerousChangeType
+    """Specific kind of dangerous schema change."""
+    description: str
+    """Human-readable description of the dangerous schema change."""
+
+
+class SafeChange(NamedTuple):
+    """Type and description of a safe change
+
+    Description of a schema change that is considered safe for existing operations.
+    """
+
+    type: SafeChangeType
+    """Specific kind of safe schema change."""
+    description: str
+    """Human-readable description of the safe schema change."""
+
+
+SchemaChange: TypeAlias = SafeChange | DangerousChange | BreakingChange
+"""Any schema change detected between two schemas."""
+
+
+def find_breaking_changes(
+    old_schema: GraphQLSchema, new_schema: GraphQLSchema
+) -> list[BreakingChange]:
+    """Find breaking changes.
+
+    Given two schemas, returns a list containing descriptions of all the types of
+    breaking changes covered by the other functions down below.
+
+    :param old_schema: Schema before the change.
+    :param new_schema: Schema after the change.
+    :returns: Breaking changes between the two schemas.
+
+    >>> from graphql import build_schema
+    >>> from graphql.utilities import find_breaking_changes
+    >>> old_schema = build_schema('''
+    ...   type Query {
+    ...     greeting: String
+    ...   }
+    ... ''')
+    >>> new_schema = build_schema('''
+    ...   type Query {
+    ...     hello: String
+    ...   }
+    ... ''')
+    >>> changes = find_breaking_changes(old_schema, new_schema)
+    >>> [change.type.name for change in changes]
+    ['FIELD_REMOVED']
+
+    .. deprecated:: 3.3
+       Please use ``find_schema_changes`` instead and filter for breaking changes.
+       Will be removed in a future version.
+    """
+    return [
+        change
+        for change in find_schema_changes(old_schema, new_schema)
+        if isinstance(change.type, BreakingChangeType)
+    ]
+
+
+def find_dangerous_changes(
+    old_schema: GraphQLSchema, new_schema: GraphQLSchema
+) -> list[DangerousChange]:
+    """Find dangerous changes.
+
+    Given two schemas, returns a list containing descriptions of all the types of
+    potentially dangerous changes covered by the other functions down below.
+
+    :param old_schema: Schema before the change.
+    :param new_schema: Schema after the change.
+    :returns: Dangerous changes between the two schemas.
+
+    >>> from graphql import build_schema
+    >>> from graphql.utilities import find_dangerous_changes
+    >>> old_schema = build_schema('''
+    ...   enum Episode {
+    ...     NEW_HOPE
+    ...   }
+    ...
+    ...   type Query {
+    ...     episode: Episode
+    ...   }
+    ... ''')
+    >>> new_schema = build_schema('''
+    ...   enum Episode {
+    ...     NEW_HOPE
+    ...     EMPIRE
+    ...   }
+    ...
+    ...   type Query {
+    ...     episode: Episode
+    ...   }
+    ... ''')
+    >>> changes = find_dangerous_changes(old_schema, new_schema)
+    >>> [change.type.name for change in changes]
+    ['VALUE_ADDED_TO_ENUM']
+
+    .. deprecated:: 3.3
+       Please use ``find_schema_changes`` instead and filter for dangerous changes.
+       Will be removed in a future version.
+    """
+    return [
+        change
+        for change in find_schema_changes(old_schema, new_schema)
+        if isinstance(change.type, DangerousChangeType)
+    ]
+
+
+def find_schema_changes(
+    old_schema: GraphQLSchema, new_schema: GraphQLSchema
+) -> list[SchemaChange]:
+    """Find schema changes.
+
+    Finds all schema changes between two schemas.
+
+    :param old_schema: Schema before the change.
+    :param new_schema: Schema after the change.
+    :returns: Safe, dangerous, and breaking changes between the two schemas.
+
+    >>> from graphql import build_schema
+    >>> from graphql.utilities import find_schema_changes
+    >>> old_schema = build_schema('''
+    ...   type Query {
+    ...     greeting: String
+    ...   }
+    ... ''')
+    >>> new_schema = build_schema('''
+    ...   type Query {
+    ...     greeting(name: String): String
+    ...     farewell: String
+    ...   }
+    ... ''')
+    >>> changes = find_schema_changes(old_schema, new_schema)
+    >>> [change.type.name for change in changes]
+    ['FIELD_ADDED', 'OPTIONAL_ARG_ADDED']
+    """
+    return find_type_changes(old_schema, new_schema) + find_directive_changes(
+        old_schema, new_schema
+    )
+
+
+def find_directive_changes(
+    old_schema: GraphQLSchema, new_schema: GraphQLSchema
+) -> list[SchemaChange]:
+    directives_diff = list_diff(old_schema.directives, new_schema.directives)
+
+    schema_changes: list[SchemaChange] = [
+        BreakingChange(
+            BreakingChangeType.DIRECTIVE_REMOVED,
+            f"Directive @{directive.name} was removed.",
+        )
+        for directive in directives_diff.removed
+    ]
+
+    schema_changes.extend(
+        SafeChange(
+            SafeChangeType.DIRECTIVE_ADDED,
+            f"Directive @{directive.name} was added.",
+        )
+        for directive in directives_diff.added
+    )
+
+    for old_directive, new_directive in directives_diff.persisted:
+        args_diff = dict_diff(old_directive.args, new_directive.args)
+
+        for arg_name, new_arg in args_diff.added.items():
+            if is_required_argument(new_arg):
+                schema_changes.append(
+                    BreakingChange(
+                        BreakingChangeType.REQUIRED_DIRECTIVE_ARG_ADDED,
+                        f"A required argument @{old_directive.name}"
+                        f"({arg_name}:) was added.",
+                    )
+                )
+            else:
+                schema_changes.append(
+                    SafeChange(
+                        SafeChangeType.OPTIONAL_DIRECTIVE_ARG_ADDED,
+                        f"An optional argument @{old_directive.name}"
+                        f"({arg_name}:) was added.",
+                    )
+                )
+
+        schema_changes.extend(
+            BreakingChange(
+                BreakingChangeType.DIRECTIVE_ARG_REMOVED,
+                f"Argument @{old_directive.name}({arg_name}:) was removed.",
+            )
+            for arg_name in args_diff.removed
+        )
+
+        for arg_name, (old_arg, new_arg) in args_diff.persisted.items():
+            is_safe = is_change_safe_for_input_object_field_or_field_arg(
+                old_arg.type, new_arg.type
+            )
+            old_default_value_str = get_default_value(old_arg)
+            new_default_value_str = get_default_value(new_arg)
+            if not is_safe:
+                schema_changes.append(
+                    BreakingChange(
+                        BreakingChangeType.ARG_CHANGED_KIND,
+                        f"Argument @{old_directive.name}({arg_name}:)"
+                        f" has changed type from"
+                        f" {old_arg.type} to {new_arg.type}.",
+                    )
+                )
+            elif old_default_value_str is not None:
+                if new_default_value_str is None:
+                    schema_changes.append(
+                        DangerousChange(
+                            DangerousChangeType.ARG_DEFAULT_VALUE_CHANGE,
+                            f"@{old_directive.name}({arg_name}:)"
+                            f" defaultValue was removed.",
+                        )
+                    )
+                elif old_default_value_str != new_default_value_str:
+                    schema_changes.append(
+                        DangerousChange(
+                            DangerousChangeType.ARG_DEFAULT_VALUE_CHANGE,
+                            f"@{old_directive.name}({arg_name}:)"
+                            f" has changed defaultValue"
+                            f" from {old_default_value_str}"
+                            f" to {new_default_value_str}.",
+                        )
+                    )
+            elif new_default_value_str is not None and old_default_value_str is None:
+                schema_changes.append(
+                    SafeChange(
+                        SafeChangeType.ARG_DEFAULT_VALUE_ADDED,
+                        f"@{old_directive.name}({arg_name}:)"
+                        f" added a defaultValue {new_default_value_str}.",
+                    )
+                )
+            elif str(old_arg.type) != str(new_arg.type):
+                schema_changes.append(
+                    SafeChange(
+                        SafeChangeType.ARG_CHANGED_KIND_SAFE,
+                        f"Argument @{old_directive.name}({arg_name}:)"
+                        f" has changed type from"
+                        f" {old_arg.type} to {new_arg.type}.",
+                    )
+                )
+
+            if old_arg.description != new_arg.description:
+                schema_changes.append(
+                    SafeChange(
+                        SafeChangeType.DESCRIPTION_CHANGED,
+                        f"Description of @{old_directive.name}"
+                        f"({old_directive.name}) has changed to"
+                        f' "{new_arg.description}".',
+                    )
+                )
+
+        if old_directive.is_repeatable and not new_directive.is_repeatable:
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.DIRECTIVE_REPEATABLE_REMOVED,
+                    f"Repeatable flag was removed from @{old_directive.name}.",
+                )
+            )
+        elif new_directive.is_repeatable and not old_directive.is_repeatable:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DIRECTIVE_REPEATABLE_ADDED,
+                    f"Repeatable flag was added to @{old_directive.name}.",
+                )
+            )
+
+        if old_directive.description != new_directive.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of @{old_directive.name} has changed to"
+                    f' "{new_directive.description}".',
+                )
+            )
+
+        schema_changes.extend(
+            BreakingChange(
+                BreakingChangeType.DIRECTIVE_LOCATION_REMOVED,
+                f"{location.name} was removed from @{new_directive.name}.",
+            )
+            for location in old_directive.locations
+            if location not in new_directive.locations
+        )
+
+        schema_changes.extend(
+            SafeChange(
+                SafeChangeType.DIRECTIVE_LOCATION_ADDED,
+                f"{location.name} was added to @{old_directive.name}.",
+            )
+            for location in new_directive.locations
+            if location not in old_directive.locations
+        )
+
+    return schema_changes
+
+
+def find_type_changes(
+    old_schema: GraphQLSchema, new_schema: GraphQLSchema
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    types_diff = dict_diff(old_schema.type_map, new_schema.type_map)
+
+    for type_name, old_type in types_diff.removed.items():
+        schema_changes.append(
+            BreakingChange(
+                BreakingChangeType.TYPE_REMOVED,
+                f"Standard scalar {type_name} was removed"
+                " because it is not referenced anymore."
+                if is_specified_scalar_type(old_type)
+                else f"{type_name} was removed.",
+            )
+        )
+
+    schema_changes.extend(
+        SafeChange(
+            SafeChangeType.TYPE_ADDED,
+            f"{new_type} was added.",
+        )
+        for new_type in types_diff.added.values()
+    )
+
+    for type_name, (old_type, new_type) in types_diff.persisted.items():
+        if old_type.description != new_type.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of {old_type.name} has changed to"
+                    f' "{new_type.description}".',
+                )
+            )
+
+        if is_enum_type(old_type) and is_enum_type(new_type):
+            schema_changes.extend(find_enum_type_changes(old_type, new_type))
+        elif is_union_type(old_type) and is_union_type(new_type):
+            schema_changes.extend(find_union_type_changes(old_type, new_type))
+        elif is_input_object_type(old_type) and is_input_object_type(new_type):
+            schema_changes.extend(find_input_object_type_changes(old_type, new_type))
+        elif (is_object_type(old_type) and is_object_type(new_type)) or (
+            is_interface_type(old_type) and is_interface_type(new_type)
+        ):
+            schema_changes.extend(find_field_changes(old_type, new_type))
+            schema_changes.extend(
+                find_implemented_interfaces_changes(old_type, new_type)
+            )
+        elif old_type.__class__ is not new_type.__class__:
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.TYPE_CHANGED_KIND,
+                    f"{type_name} changed from {type_kind_name(old_type)}"
+                    f" to {type_kind_name(new_type)}.",
+                )
+            )
+
+    return schema_changes
+
+
+def find_input_object_type_changes(
+    old_type: GraphQLInputObjectType,
+    new_type: GraphQLInputObjectType,
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    fields_diff = dict_diff(old_type.fields, new_type.fields)
+
+    for field_name, new_field in fields_diff.added.items():
+        if is_required_input_field(new_field):
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.REQUIRED_INPUT_FIELD_ADDED,
+                    f"A required field {old_type}.{field_name} was added.",
+                )
+            )
+        else:
+            schema_changes.append(
+                DangerousChange(
+                    DangerousChangeType.OPTIONAL_INPUT_FIELD_ADDED,
+                    f"An optional field {old_type}.{field_name} was added.",
+                )
+            )
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.FIELD_REMOVED,
+            f"Field {old_type}.{field_name} was removed.",
+        )
+        for field_name in fields_diff.removed
+    )
+
+    for field_name, (old_field, new_field) in fields_diff.persisted.items():
+        is_safe = is_change_safe_for_input_object_field_or_field_arg(
+            old_field.type, new_field.type
+        )
+
+        old_default_value_str = get_default_value(old_field)
+        new_default_value_str = get_default_value(new_field)
+        if not is_safe:
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.FIELD_CHANGED_KIND,
+                    f"Field {old_type}.{field_name} changed type"
+                    f" from {old_field.type} to {new_field.type}.",
+                )
+            )
+        elif old_default_value_str is not None:
+            if new_default_value_str is None:
+                schema_changes.append(
+                    DangerousChange(
+                        DangerousChangeType.INPUT_FIELD_DEFAULT_VALUE_CHANGE,
+                        f"{old_type}.{field_name} defaultValue was removed.",
+                    )
+                )
+            elif old_default_value_str != new_default_value_str:
+                schema_changes.append(
+                    DangerousChange(
+                        DangerousChangeType.INPUT_FIELD_DEFAULT_VALUE_CHANGE,
+                        f"{old_type}.{field_name} has changed defaultValue"
+                        f" from {old_default_value_str}"
+                        f" to {new_default_value_str}.",
+                    )
+                )
+        elif new_default_value_str is not None and old_default_value_str is None:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.INPUT_FIELD_DEFAULT_VALUE_ADDED,
+                    f"{old_type}.{field_name} added a defaultValue"
+                    f" {new_default_value_str}.",
+                )
+            )
+        elif str(old_field.type) != str(new_field.type):
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.FIELD_CHANGED_KIND_SAFE,
+                    f"Field {old_type}.{field_name} changed type"
+                    f" from {old_field.type} to {new_field.type}.",
+                )
+            )
+
+        if old_field.description != new_field.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of input-field {new_type}.{field_name}"
+                    f' has changed to "{new_field.description}".',
+                )
+            )
+
+    return schema_changes
+
+
+def find_union_type_changes(
+    old_type: GraphQLUnionType, new_type: GraphQLUnionType
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    possible_types_diff = list_diff(old_type.types, new_type.types)
+
+    schema_changes.extend(
+        DangerousChange(
+            DangerousChangeType.TYPE_ADDED_TO_UNION,
+            f"{possible_type} was added to union type {old_type}.",
+        )
+        for possible_type in possible_types_diff.added
+    )
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.TYPE_REMOVED_FROM_UNION,
+            f"{possible_type} was removed from union type {old_type}.",
+        )
+        for possible_type in possible_types_diff.removed
+    )
+
+    return schema_changes
+
+
+def find_enum_type_changes(
+    old_type: GraphQLEnumType, new_type: GraphQLEnumType
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    values_diff = dict_diff(old_type.values, new_type.values)
+
+    schema_changes.extend(
+        DangerousChange(
+            DangerousChangeType.VALUE_ADDED_TO_ENUM,
+            f"Enum value {old_type}.{value_name} was added.",
+        )
+        for value_name in values_diff.added
+    )
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.VALUE_REMOVED_FROM_ENUM,
+            f"Enum value {old_type}.{value_name} was removed.",
+        )
+        for value_name in values_diff.removed
+    )
+
+    for value_name, (old_value, new_value) in values_diff.persisted.items():
+        if old_value.description != new_value.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of enum value {old_type}.{value_name}"
+                    f' has changed to "{new_value.description}".',
+                )
+            )
+
+    return schema_changes
+
+
+def find_implemented_interfaces_changes(
+    old_type: GraphQLObjectType | GraphQLInterfaceType,
+    new_type: GraphQLObjectType | GraphQLInterfaceType,
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    interfaces_diff = list_diff(old_type.interfaces, new_type.interfaces)
+
+    schema_changes.extend(
+        DangerousChange(
+            DangerousChangeType.IMPLEMENTED_INTERFACE_ADDED,
+            f"{interface.name} added to interfaces implemented by {old_type}.",
+        )
+        for interface in interfaces_diff.added
+    )
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.IMPLEMENTED_INTERFACE_REMOVED,
+            f"{old_type} no longer implements interface {interface.name}.",
+        )
+        for interface in interfaces_diff.removed
+    )
+
+    return schema_changes
+
+
+def find_field_changes(
+    old_type: GraphQLObjectType | GraphQLInterfaceType,
+    new_type: GraphQLObjectType | GraphQLInterfaceType,
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    fields_diff = dict_diff(old_type.fields, new_type.fields)
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.FIELD_REMOVED,
+            f"Field {old_type}.{field_name} was removed.",
+        )
+        for field_name in fields_diff.removed
+    )
+
+    schema_changes.extend(
+        SafeChange(
+            SafeChangeType.FIELD_ADDED,
+            f"Field {old_type}.{field_name} was added.",
+        )
+        for field_name in fields_diff.added
+    )
+
+    for field_name, (old_field, new_field) in fields_diff.persisted.items():
+        schema_changes.extend(
+            find_arg_changes(old_type, field_name, old_field, new_field)
+        )
+        is_safe = is_change_safe_for_object_or_interface_field(
+            old_field.type, new_field.type
+        )
+        if not is_safe:
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.FIELD_CHANGED_KIND,
+                    f"Field {old_type}.{field_name} changed type"
+                    f" from {old_field.type} to {new_field.type}.",
+                )
+            )
+        elif str(old_field.type) != str(new_field.type):
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.FIELD_CHANGED_KIND_SAFE,
+                    f"Field {old_type}.{field_name} changed type"
+                    f" from {old_field.type} to {new_field.type}.",
+                )
+            )
+
+        if old_field.description != new_field.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of field {old_type}.{field_name}"
+                    f' has changed to "{new_field.description}".',
+                )
+            )
+
+    return schema_changes
+
+
+def find_arg_changes(
+    old_type: GraphQLObjectType | GraphQLInterfaceType,
+    field_name: str,
+    old_field: GraphQLField,
+    new_field: GraphQLField,
+) -> list[SchemaChange]:
+    schema_changes: list[SchemaChange] = []
+    args_diff = dict_diff(old_field.args, new_field.args)
+
+    schema_changes.extend(
+        BreakingChange(
+            BreakingChangeType.ARG_REMOVED,
+            f"Argument {old_type}.{field_name}({arg_name}:) was removed.",
+        )
+        for arg_name in args_diff.removed
+    )
+
+    for arg_name, (old_arg, new_arg) in args_diff.persisted.items():
+        is_safe = is_change_safe_for_input_object_field_or_field_arg(
+            old_arg.type, new_arg.type
+        )
+        old_default_value_str = get_default_value(old_arg)
+        new_default_value_str = get_default_value(new_arg)
+        if not is_safe:
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.ARG_CHANGED_KIND,
+                    f"Argument {old_type}.{field_name}({arg_name}:)"
+                    f" has changed type from"
+                    f" {old_arg.type} to {new_arg.type}.",
+                )
+            )
+        elif old_default_value_str is not None:
+            if new_default_value_str is None:
+                schema_changes.append(
+                    DangerousChange(
+                        DangerousChangeType.ARG_DEFAULT_VALUE_CHANGE,
+                        f"{old_type}.{field_name}({arg_name}:)"
+                        f" defaultValue was removed.",
+                    )
+                )
+            elif old_default_value_str != new_default_value_str:
+                schema_changes.append(
+                    DangerousChange(
+                        DangerousChangeType.ARG_DEFAULT_VALUE_CHANGE,
+                        f"{old_type}.{field_name}({arg_name}:)"
+                        f" has changed defaultValue"
+                        f" from {old_default_value_str}"
+                        f" to {new_default_value_str}.",
+                    )
+                )
+        elif new_default_value_str is not None and old_default_value_str is None:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.ARG_DEFAULT_VALUE_ADDED,
+                    f"{old_type}.{field_name}({arg_name}:)"
+                    f" added a defaultValue {new_default_value_str}.",
+                )
+            )
+        elif str(old_arg.type) != str(new_arg.type):
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.ARG_CHANGED_KIND_SAFE,
+                    f"Argument {old_type}.{field_name}({arg_name}:)"
+                    f" has changed type from"
+                    f" {old_arg.type} to {new_arg.type}.",
+                )
+            )
+
+        if old_arg.description != new_arg.description:
+            schema_changes.append(
+                SafeChange(
+                    SafeChangeType.DESCRIPTION_CHANGED,
+                    f"Description of argument {old_type}.{field_name}"
+                    f'({arg_name}) has changed to "{new_arg.description}".',
+                )
+            )
+
+    for arg_name, new_arg in args_diff.added.items():
+        if is_required_argument(new_arg):
+            schema_changes.append(
+                BreakingChange(
+                    BreakingChangeType.REQUIRED_ARG_ADDED,
+                    f"A required argument {old_type}.{field_name}"
+                    f"({arg_name}:) was added.",
+                )
+            )
+        else:
+            schema_changes.append(
+                DangerousChange(
+                    DangerousChangeType.OPTIONAL_ARG_ADDED,
+                    f"An optional argument {old_type}.{field_name}"
+                    f"({arg_name}:) was added.",
+                )
+            )
+
+    return schema_changes
+
+
+def is_change_safe_for_object_or_interface_field(
+    old_type: GraphQLType, new_type: GraphQLType
+) -> bool:
+    if is_list_type(old_type):
+        return (
+            # if they're both lists, make sure underlying types are compatible
+            is_list_type(new_type)
+            and is_change_safe_for_object_or_interface_field(
+                old_type.of_type, new_type.of_type
+            )
+        ) or (
+            # moving from nullable to non-null of same underlying type is safe
+            is_non_null_type(new_type)
+            and is_change_safe_for_object_or_interface_field(old_type, new_type.of_type)
+        )
+
+    if is_non_null_type(old_type):
+        # if they're both non-null, make sure underlying types are compatible
+        return is_non_null_type(
+            new_type
+        ) and is_change_safe_for_object_or_interface_field(
+            old_type.of_type, new_type.of_type
+        )
+
+    if is_named_type(old_type):
+        return (
+            # if they're both named types, see if their names are equivalent
+            is_named_type(new_type) and old_type.name == new_type.name
+        ) or (
+            # moving from nullable to non-null of same underlying type is safe
+            is_non_null_type(new_type)
+            and is_change_safe_for_object_or_interface_field(old_type, new_type.of_type)
+        )
+
+    # Not reachable. All possible output types have been considered.
+    msg = f"Unexpected type {inspect(old_type)}"  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
+def is_change_safe_for_input_object_field_or_field_arg(
+    old_type: GraphQLType, new_type: GraphQLType
+) -> bool:
+    if is_list_type(old_type):
+        return is_list_type(
+            # if they're both lists, make sure underlying types are compatible
+            new_type
+        ) and is_change_safe_for_input_object_field_or_field_arg(
+            old_type.of_type, new_type.of_type
+        )
+
+    if is_non_null_type(old_type):
+        return (
+            # if they're both non-null, make sure the underlying types are compatible
+            is_non_null_type(new_type)
+            and is_change_safe_for_input_object_field_or_field_arg(
+                old_type.of_type, new_type.of_type
+            )
+        ) or (
+            # moving from non-null to nullable of same underlying type is safe
+            not is_non_null_type(new_type)
+            and is_change_safe_for_input_object_field_or_field_arg(
+                old_type.of_type, new_type
+            )
+        )
+
+    if is_named_type(old_type):
+        return (
+            # if they're both named types, see if their names are equivalent
+            is_named_type(new_type) and old_type.name == new_type.name
+        )
+
+    # Not reachable. All possible output types have been considered.
+    msg = f"Unexpected type {inspect(old_type)}"  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
+def type_kind_name(type_: GraphQLNamedType) -> str:
+    match type_:
+        case GraphQLScalarType():
+            return "a Scalar type"
+        case GraphQLObjectType():
+            return "an Object type"
+        case GraphQLInterfaceType():
+            return "an Interface type"
+        case GraphQLUnionType():
+            return "a Union type"
+        case GraphQLEnumType():
+            return "an Enum type"
+        case GraphQLInputObjectType():
+            return "an Input type"
+        case _:  # pragma: no cover
+            # Not reachable. All possible named types have been considered.
+            msg = f"Unexpected type {inspect(type_)}"
+            raise TypeError(msg)
+
+
+def get_default_value(
+    arg_or_input_field: GraphQLArgument | GraphQLInputField,
+) -> str | None:
+    # Since we are looking only for client's observable changes we should
+    # compare default values in the same representation as they are
+    # represented inside introspection.
+    ast = get_default_value_ast(arg_or_input_field)
+    if ast:
+        return print_ast(sort_value_node(ast))
+    return None
+
+
+class ListDiff(NamedTuple):
+    """Tuple with added, removed and persisted list items."""
+
+    added: list
+    removed: list
+    persisted: list
+
+
+def list_diff(old_list: Collection, new_list: Collection) -> ListDiff:
+    """Get differences between two lists of named items."""
+    persisted = []
+    removed = []
+
+    old_set = {item.name for item in old_list}
+    new_map = {item.name: item for item in new_list}
+
+    for old_item in old_list:
+        new_item = new_map.get(old_item.name)
+        if new_item:
+            persisted.append([old_item, new_item])
+        else:
+            removed.append(old_item)
+
+    added = [new_item for new_item in new_list if new_item.name not in old_set]
+
+    return ListDiff(added, removed, persisted)
+
+
+class DictDiff(NamedTuple):
+    """Tuple with added, removed and persisted dict entries."""
+
+    added: dict
+    removed: dict
+    persisted: dict
+
+
+def dict_diff(old_dict: dict, new_dict: dict) -> DictDiff:
+    """Get differences between two dicts."""
+    removed = {}
+    persisted = {}
+
+    for old_name, old_item in old_dict.items():
+        new_item = new_dict.get(old_name)
+        if new_item:
+            persisted[old_name] = [old_item, new_item]
+        else:
+            removed[old_name] = old_item
+
+    added = {
+        new_name: new_item
+        for new_name, new_item in new_dict.items()
+        if new_name not in old_dict
+    }
+
+    return DictDiff(added, removed, persisted)

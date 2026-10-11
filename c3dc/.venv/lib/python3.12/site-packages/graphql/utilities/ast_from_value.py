@@ -1,0 +1,161 @@
+"""GraphQL AST creation from Python"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from math import isfinite
+from typing import Any
+
+from ..language import (
+    BooleanValueNode,
+    ConstListValueNode,
+    ConstObjectFieldNode,
+    ConstObjectValueNode,
+    ConstValueNode,
+    EnumValueNode,
+    FloatValueNode,
+    IntValueNode,
+    NameNode,
+    NullValueNode,
+    StringValueNode,
+)
+from ..pyutils import Undefined, inspect, is_iterable
+from ..type import (
+    GraphQLID,
+    GraphQLInputType,
+    is_enum_type,
+    is_input_object_type,
+    is_leaf_type,
+    is_list_type,
+    is_non_null_type,
+)
+
+__all__ = ["ast_from_value"]
+
+_re_integer_string = re.compile("^-?(?:0|[1-9][0-9]*)$")
+
+
+def ast_from_value(value: Any, type_: GraphQLInputType) -> ConstValueNode | None:
+    """Produce a GraphQL Value AST given a Python object.
+
+    This function will match Python/JSON values to GraphQL AST schema format by using
+    the suggested GraphQLInputType.
+
+    A GraphQL type must be provided, which will be used to interpret different Python
+    values.
+
+    ================ =======================
+       JSON Value         GraphQL Value
+    ================ =======================
+       Object          Input Object
+       Array           List
+       Boolean         Boolean
+       String          String / Enum Value
+       Number          Int / Float
+       Mixed           Enum Value
+       null            NullValue
+    ================ =======================
+
+    :param value: Runtime value to convert.
+    :param type_: The GraphQL input type used to interpret the value.
+    :returns: A GraphQL value AST for the provided Python value, or ``None`` when no
+        literal can represent it.
+
+    >>> from graphql import (
+    ...     GraphQLInputField, GraphQLInputObjectType, GraphQLInt, GraphQLList,
+    ...     GraphQLNonNull, GraphQLString, Undefined, ast_from_value, print_ast)
+    >>> ReviewInput = GraphQLInputObjectType('ReviewInput', {
+    ...     'stars': GraphQLInputField(GraphQLNonNull(GraphQLInt)),
+    ...     'tags': GraphQLInputField(GraphQLList(GraphQLString)),
+    ... })
+    >>> value_node = ast_from_value(
+    ...     {'stars': 5, 'tags': ['featured', 'verified']}, ReviewInput)
+    >>> print(print_ast(value_node))
+    { stars: 5, tags: ["featured", "verified"] }
+    >>> print(ast_from_value(Undefined, GraphQLString))
+    None
+    >>> print(ast_from_value(None, GraphQLNonNull(GraphQLString)))
+    None
+
+    .. deprecated:: 3.3
+        Use :func:`~graphql.utilities.value_to_literal` instead, with care to operate
+        on external values. ``ast_from_value`` will be removed in a future version.
+    """
+    if is_non_null_type(type_):
+        ast_value = ast_from_value(value, type_.of_type)
+        if isinstance(ast_value, NullValueNode):
+            return None
+        return ast_value
+
+    # only explicit None, not Undefined or NaN
+    if value is None:
+        return NullValueNode()
+
+    # undefined
+    if value is Undefined:
+        return None
+
+    # Convert Python list to GraphQL list. If the GraphQLType is a list, but the value
+    # is not a list, convert the value using the list's item type.
+    if is_list_type(type_):
+        item_type = type_.of_type
+        if is_iterable(value):
+            maybe_value_nodes = (ast_from_value(item, item_type) for item in value)
+            value_nodes = tuple(node for node in maybe_value_nodes if node)
+            return ConstListValueNode(values=value_nodes)
+        return ast_from_value(value, item_type)
+
+    # Populate the fields of the input object by creating ASTs from each value in the
+    # Python dict according to the fields in the input type.
+    if is_input_object_type(type_):
+        if value is None or not isinstance(value, Mapping):
+            return None
+        field_items = (
+            (field_name, ast_from_value(value[field_name], field.type))
+            for field_name, field in type_.fields.items()
+            if field_name in value
+        )
+        field_nodes = tuple(
+            ConstObjectFieldNode(name=NameNode(value=field_name), value=field_value)
+            for field_name, field_value in field_items
+            if field_value
+        )
+        return ConstObjectValueNode(fields=field_nodes)
+
+    if is_leaf_type(type_):
+        # Since value is an internally represented value, it must be coerced to an
+        # externally represented value before converting into an AST.
+        coerced = type_.coerce_output_value(value)
+        if coerced is None or coerced is Undefined:
+            return None
+
+        # Others coerce based on their corresponding Python scalar types.
+        if isinstance(coerced, bool):
+            return BooleanValueNode(value=coerced)
+
+        # Python ints and floats correspond nicely to Int and Float values.
+        if isinstance(coerced, int):
+            return IntValueNode(value=str(coerced))
+        if isinstance(coerced, float) and isfinite(coerced):
+            value = str(coerced)
+            value = value.removesuffix(".0")
+            return FloatValueNode(value=value)
+
+        if isinstance(coerced, str):
+            # Enum types use Enum literals.
+            if is_enum_type(type_):
+                return EnumValueNode(value=coerced)
+
+            # ID types can use Int literals.
+            if type_ is GraphQLID and _re_integer_string.match(coerced):
+                return IntValueNode(value=coerced)
+
+            return StringValueNode(value=coerced)
+
+        msg = f"Cannot convert value to AST: {inspect(coerced)}."
+        raise TypeError(msg)
+
+    # Not reachable. All possible input types have been considered.
+    msg = f"Unexpected input type: {inspect(type_)}."  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover

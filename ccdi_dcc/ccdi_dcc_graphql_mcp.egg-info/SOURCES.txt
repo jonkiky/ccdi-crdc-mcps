@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+ccdi_dcc_graphql_mcp.egg-info/PKG-INFO
+ccdi_dcc_graphql_mcp.egg-info/SOURCES.txt
+ccdi_dcc_graphql_mcp.egg-info/dependency_links.txt
+ccdi_dcc_graphql_mcp.egg-info/requires.txt
+ccdi_dcc_graphql_mcp.egg-info/top_level.txt
+ccdi_dcc_mcp/__init__.py
+ccdi_dcc_mcp/catalog.py
+ccdi_dcc_mcp/query.py
+ccdi_dcc_mcp/server.py
+ccdi_dcc_mcp/assets/ccdi-model-props.yml
+ccdi_dcc_mcp/assets/graphql-introspection.json
+tests/test_catalog_query.py
+tests/test_server.py

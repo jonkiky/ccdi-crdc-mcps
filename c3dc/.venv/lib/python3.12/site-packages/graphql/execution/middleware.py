@@ -1,0 +1,109 @@
+"""Middleware manager"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from functools import partial, reduce
+from inspect import isfunction
+from typing import Any, TypeAlias
+
+__all__ = ["MiddlewareManager"]
+
+GraphQLFieldResolver: TypeAlias = Callable[..., Any]
+
+
+class MiddlewareManager:
+    """Manager for the middleware chain.
+
+    This class helps to wrap resolver functions with the provided middleware functions
+    and/or objects. The functions take the next middleware function as first argument.
+    If middleware is provided as an object, it must provide a method ``resolve`` that is
+    used as the middleware function.
+
+    Note that since resolvers return "AwaitableOrValue"s, all middleware functions
+    must be aware of this and check whether values are awaitable before awaiting them.
+
+    Uppercase all string results with a middleware function:
+
+    >>> from graphql import MiddlewareManager, build_schema, graphql_sync
+    >>> def upper_middleware(next_, root, info, **args):
+    ...     result = next_(root, info, **args)
+    ...     return result.upper() if isinstance(result, str) else result
+    >>> schema = build_schema('type Query { greeting: String }')
+    >>> graphql_sync(
+    ...     schema,
+    ...     '{ greeting }',
+    ...     root_value={'greeting': 'Hello'},
+    ...     middleware=MiddlewareManager(upper_middleware),
+    ... )
+    ExecutionResult(data={'greeting': 'HELLO'}, errors=None)
+
+    Middleware can also be provided as objects with a ``resolve`` method:
+
+    >>> class ExclaimMiddleware:
+    ...     def resolve(self, next_, root, info, **args):
+    ...         return next_(root, info, **args) + '!'
+    >>> graphql_sync(
+    ...     schema,
+    ...     '{ greeting }',
+    ...     root_value={'greeting': 'Hello'},
+    ...     middleware=MiddlewareManager(ExclaimMiddleware(), upper_middleware),
+    ... )
+    ExecutionResult(data={'greeting': 'HELLO!'}, errors=None)
+    """
+
+    # allow custom attributes (not used internally)
+    __slots__ = "__dict__", "_cached_resolvers", "_middleware_resolvers", "middlewares"
+
+    _cached_resolvers: dict[GraphQLFieldResolver, GraphQLFieldResolver]
+    _middleware_resolvers: list[Callable] | None
+
+    def __init__(self, *middlewares: Any) -> None:
+        self.middlewares = middlewares
+        self._middleware_resolvers = (
+            list(get_middleware_resolvers(middlewares)) if middlewares else None
+        )
+        self._cached_resolvers = {}
+
+    def get_field_resolver(
+        self, field_resolver: GraphQLFieldResolver
+    ) -> GraphQLFieldResolver:
+        """Wrap the provided resolver with the middleware.
+
+        Returns a function that chains the middleware functions with the provided
+        resolver function.
+
+        :param field_resolver: The resolver function that shall be wrapped.
+        :returns: The resolver function wrapped with the middleware.
+
+        >>> from graphql import MiddlewareManager
+        >>> def double(next_, root, info, **args):
+        ...     return 2 * next_(root, info, **args)
+        >>> resolver = MiddlewareManager(double).get_field_resolver(
+        ...     lambda root, info: root
+        ... )
+        >>> resolver(21, None)
+        42
+        """
+        if self._middleware_resolvers is None:
+            return field_resolver
+        if field_resolver not in self._cached_resolvers:
+            self._cached_resolvers[field_resolver] = reduce(
+                lambda chained_fns, next_fn: partial(next_fn, chained_fns),
+                self._middleware_resolvers,
+                field_resolver,
+            )
+        return self._cached_resolvers[field_resolver]
+
+
+def get_middleware_resolvers(middlewares: tuple[Any, ...]) -> Iterator[Callable]:
+    """Get a list of resolver functions from a list of classes or functions.
+
+    :meta private:
+    """
+    for middleware in middlewares:
+        if isfunction(middleware):
+            yield middleware
+        elif resolver_func := getattr(middleware, "resolve", None):
+            # middleware provided as object with 'resolve' method
+            yield resolver_func

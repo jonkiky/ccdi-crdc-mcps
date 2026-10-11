@@ -1,0 +1,195 @@
+"""Conversion from GraphQL value AST to Python values."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+from ..language import (
+    ListValueNode,
+    NullValueNode,
+    ObjectValueNode,
+    ValueNode,
+    VariableNode,
+)
+from ..pyutils import Undefined, inspect
+from ..type import (
+    GraphQLInputType,
+    GraphQLScalarType,
+    is_input_object_type,
+    is_leaf_type,
+    is_list_type,
+    is_non_null_type,
+)
+
+__all__ = ["value_from_ast"]
+
+
+def value_from_ast(
+    value_node: ValueNode | None,
+    type_: GraphQLInputType,
+    variables: dict[str, Any] | None = None,
+) -> Any:
+    """Produce a Python value given a GraphQL Value AST.
+
+    A GraphQL type must be provided, which will be used to interpret different GraphQL
+    Value literals.
+
+    Returns ``Undefined`` when the value could not be validly coerced according
+    to the provided type.
+
+    =================== ============== ================
+       GraphQL Value      JSON Value     Python Value
+    =================== ============== ================
+       Input Object       Object         dict
+       List               Array          list
+       Boolean            Boolean        bool
+       String             String         str
+       Int / Float        Number         int / float
+       Enum Value         Mixed          Any
+       NullValue          null           None
+    =================== ============== ================
+
+    :param value_node: GraphQL value AST node to convert.
+    :param type_: The GraphQL input type used to interpret the value.
+    :param variables: Optional runtime variable values keyed by variable name.
+    :returns: The coerced Python value, or ``Undefined`` if the AST value cannot be
+        coerced to the type.
+
+    Coerce literal values without variables:
+
+    >>> from graphql import (
+    ...     GraphQLInputField, GraphQLInputObjectType, GraphQLInt, GraphQLList,
+    ...     GraphQLNonNull, GraphQLString, parse_value, value_from_ast)
+    >>> ReviewInput = GraphQLInputObjectType('ReviewInput', {
+    ...     'stars': GraphQLInputField(GraphQLNonNull(GraphQLInt)),
+    ...     'tags': GraphQLInputField(GraphQLList(GraphQLString)),
+    ... })
+    >>> value_from_ast(parse_value('{ stars: 5, tags: ["featured"] }'), ReviewInput)
+    {'stars': 5, 'tags': ['featured']}
+    >>> value_from_ast(parse_value('{ stars: "bad" }'), ReviewInput)
+    Undefined
+
+    This variant resolves variable references from runtime values:
+
+    >>> value_from_ast(parse_value('$stars'), GraphQLInt, {'stars': 5})
+    5
+    >>> value_from_ast(parse_value('$stars'), GraphQLInt, {})
+    Undefined
+
+    .. deprecated:: 3.3
+        Use :func:`~graphql.utilities.coerce_input_literal` instead.
+        ``value_from_ast`` will be removed in a future version.
+    """
+    if not value_node:
+        # When there is no node, then there is also no value.
+        # Importantly, this is different from returning the value null.
+        return Undefined
+
+    if isinstance(value_node, VariableNode):
+        variable_name = value_node.name.value
+        variable_value = (
+            variables.get(variable_name, Undefined) if variables else Undefined
+        )
+        if variable_value is Undefined:
+            return Undefined
+        if variable_value is None and is_non_null_type(type_):
+            return Undefined
+        # Note: This does no further checking that this variable is correct.
+        # This assumes that this query has been validated and the variable usage here
+        # is of the correct type.
+        return variable_value
+
+    if is_non_null_type(type_):
+        if isinstance(value_node, NullValueNode):
+            return Undefined
+        return value_from_ast(value_node, type_.of_type, variables)
+
+    if isinstance(value_node, NullValueNode):
+        return None  # This is explicitly returning the value None.
+
+    if is_list_type(type_):
+        item_type = type_.of_type
+        if isinstance(value_node, ListValueNode):
+            coerced_values: list[Any] = []
+            append_value = coerced_values.append
+            for item_node in value_node.values:
+                if is_missing_variable(item_node, variables):
+                    # If an array contains a missing variable, it is either coerced to
+                    # None or if the item type is non-null, it is considered invalid.
+                    if is_non_null_type(item_type):
+                        return Undefined
+                    append_value(None)
+                else:
+                    item_value = value_from_ast(item_node, item_type, variables)
+                    if item_value is Undefined:
+                        return Undefined
+                    append_value(item_value)
+            return coerced_values
+        coerced_value = value_from_ast(value_node, item_type, variables)
+        if coerced_value is Undefined:
+            return Undefined
+        return [coerced_value]
+
+    if is_input_object_type(type_):
+        if not isinstance(value_node, ObjectValueNode):
+            return Undefined
+        coerced_obj: dict[str, Any] = {}
+        fields = type_.fields
+        field_nodes = {field.name.value: field for field in value_node.fields}
+        # Ensure every provided field is defined.
+        if any(field_name not in fields for field_name in field_nodes):
+            return Undefined  # Invalid: intentionally return no value.
+        for field_name, field in fields.items():
+            field_node = field_nodes.get(field_name)
+            if not field_node or is_missing_variable(field_node.value, variables):
+                if field.default_value is not Undefined:
+                    # Use out name as name if it exists (extension of GraphQL.js).
+                    coerced_obj[field.out_name or field_name] = field.default_value
+                elif is_non_null_type(field.type):  # pragma: no branch
+                    return Undefined
+                continue
+            field_value = value_from_ast(field_node.value, field.type, variables)
+            if field_value is Undefined:
+                return Undefined
+            coerced_obj[field.out_name or field_name] = field_value
+
+        if type_.is_one_of:
+            if len(field_nodes) != 1 or len(coerced_obj) != 1:
+                return Undefined
+
+            for field_name, field_node in field_nodes.items():
+                out_name = fields[field_name].out_name or field_name
+                if (
+                    isinstance(field_node.value, NullValueNode)
+                    or coerced_obj.get(out_name, Undefined) is None
+                ):
+                    return Undefined
+
+        return type_.out_type(coerced_obj)
+
+    if is_leaf_type(type_):
+        # Scalars fulfill parsing a literal value via `parse_literal()`. Invalid values
+        # represent a failure to parse correctly, in which case Undefined is returned.
+        type_ = cast("GraphQLScalarType", type_)
+        try:
+            if variables:
+                result = type_.parse_literal(value_node, variables)
+            else:
+                result = type_.parse_literal(value_node)
+        except Exception:  # noqa: BLE001
+            return Undefined
+        return result
+
+    # Not reachable. All possible input types have been considered.
+    msg = f"Unexpected input type: {inspect(type_)}."  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
+def is_missing_variable(
+    value_node: ValueNode,
+    variables: dict[str, Any] | None = None,
+) -> bool:
+    """Check if ``value_node`` is a variable not defined in the variables dict."""
+    return isinstance(value_node, VariableNode) and (
+        not variables or variables.get(value_node.name.value, Undefined) is Undefined
+    )

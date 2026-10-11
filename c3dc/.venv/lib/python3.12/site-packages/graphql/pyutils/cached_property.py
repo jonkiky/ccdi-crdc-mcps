@@ -1,0 +1,38 @@
+"""Cached properties"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    standard_cached_property = None
+else:
+    from functools import cached_property as standard_cached_property
+
+if standard_cached_property:
+    cached_property = standard_cached_property
+else:
+    # Code taken from https://github.com/bottlepy/bottle
+
+    class CachedProperty:
+        """A cached property.
+
+        A property that is only computed once per instance and then replaces itself with
+        an ordinary attribute. Deleting the attribute resets the property.
+        """
+
+        def __init__(self, func: Callable) -> None:
+            self.__doc__ = func.__doc__
+            self.func = func
+
+        def __get__(self, obj: object, cls: type) -> Any:
+            if obj is None:
+                return self
+            value = obj.__dict__[self.func.__name__] = self.func(obj)
+            return value
+
+    cached_property = CachedProperty
+
+__all__ = ["cached_property"]
